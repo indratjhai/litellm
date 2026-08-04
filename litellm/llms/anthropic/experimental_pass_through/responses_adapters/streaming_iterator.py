@@ -134,16 +134,10 @@ class AnthropicResponsesStreamWrapper:
                     }
                 )
             elif item_type == "reasoning":
-                block_idx = self._next_block_index()
-                if item_id:
-                    self._item_id_to_block_index[item_id] = block_idx
-                self._chunk_queue.append(
-                    {
-                        "type": "content_block_start",
-                        "index": block_idx,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    }
-                )
+                # ChatGPT may emit a reasoning item with no summary text. Do
+                # not create an empty Anthropic thinking block: Claude Code
+                # persists it and rejects it in a later request.
+                pass
             return
 
         # ---- text delta ----
@@ -190,11 +184,20 @@ class AnthropicResponsesStreamWrapper:
             delta = getattr(event, "delta", "") or (
                 event.get("delta", "") if isinstance(event, dict) else ""
             )
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            if not delta:
+                return
+            block_idx = self._item_id_to_block_index.get(item_id, -1) if item_id else -1
+            if block_idx < 0:
+                block_idx = self._next_block_index()
+                if item_id:
+                    self._item_id_to_block_index[item_id] = block_idx
+                self._chunk_queue.append(
+                    {
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }
+                )
             self._chunk_queue.append(
                 {
                     "type": "content_block_delta",
@@ -237,11 +240,9 @@ class AnthropicResponsesStreamWrapper:
                 if item
                 else None
             )
-            block_idx = (
-                self._item_id_to_block_index.get(item_id, self._current_block_index)
-                if item_id
-                else self._current_block_index
-            )
+            if not item_id or item_id not in self._item_id_to_block_index:
+                return
+            block_idx = self._item_id_to_block_index[item_id]
             self._chunk_queue.append(
                 {
                     "type": "content_block_stop",

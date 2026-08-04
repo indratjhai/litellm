@@ -441,14 +441,9 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     }
                 }
 
-        # context_management: Anthropic dict -> OpenAI array
-        context_management = anthropic_request.get("context_management")
-        if isinstance(context_management, dict):
-            openai_cm = self.translate_context_management_to_responses_api(
-                context_management
-            )
-            if openai_cm is not None:
-                responses_kwargs["context_management"] = openai_cm
+        # ChatGPT native compaction returns an opaque compaction item rather
+        # than an assistant message. Claude Code's /compact needs the latter.
+        # Leave this Anthropic-only directive out of the Responses request.
 
         # metadata user_id -> user
         metadata = anthropic_request.get("metadata")

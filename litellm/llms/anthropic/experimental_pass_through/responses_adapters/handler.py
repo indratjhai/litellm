@@ -71,6 +71,22 @@ def _build_responses_kwargs(
 
     anthropic_request = AnthropicMessagesRequest(**request_data)  # type: ignore[typeddict-item]
     custom_llm_provider = (extra_kwargs or {}).get("custom_llm_provider")
+    if custom_llm_provider == "chatgpt" and tools:
+        # ChatGPT subscription Responses rejects LiteLLM's web_search_preview
+        # translation. Claude Code can continue with its local tools.
+        tools = [
+            tool
+            for tool in tools
+            if not (
+                str(tool.get("type", "")).startswith("web_search")
+                or tool.get("name") == "web_search"
+            )
+        ]
+        if not tools:
+            request_data.pop("tools", None)
+        else:
+            request_data["tools"] = tools
+        anthropic_request = AnthropicMessagesRequest(**request_data)  # type: ignore[typeddict-item]
     responses_kwargs = _ADAPTER.translate_request(
         anthropic_request,
         use_developer_role_for_system=custom_llm_provider == "chatgpt",
@@ -106,10 +122,9 @@ def _build_responses_kwargs(
             from litellm.types.utils import CallTypes
 
             if isinstance(value, LiteLLMLoggingObject):
-                # Reclassify as acompletion so the success handler doesn't try to
-                # validate the Responses API event as an AnthropicResponse.
-                # (Mirrors the pattern used in LiteLLMMessagesToCompletionTransformationHandler.)
-                setattr(value, "call_type", CallTypes.anthropic_messages.value)
+                # The success handler receives the raw Responses object, not the
+                # translated Anthropic response, so log it as a completion.
+                setattr(value, "call_type", CallTypes.acompletion.value)
             responses_kwargs[key] = value
         elif key not in excluded and key not in responses_kwargs and value is not None:
             responses_kwargs[key] = value
