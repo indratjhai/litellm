@@ -74,6 +74,26 @@ async def _reduce_oversized_compaction(
     recent_items.reverse()
     old_items = input_items[: len(input_items) - len(recent_items)]
 
+    # Responses requires every function_call_output to retain its matching
+    # function_call. Move orphaned outputs into the summarized portion rather
+    # than sending an invalid dangling reference in the live context.
+    recent_call_ids = {
+        item.get("call_id")
+        for item in recent_items
+        if item.get("type") == "function_call" and item.get("call_id")
+    }
+    orphaned_outputs = [
+        item
+        for item in recent_items
+        if item.get("type") == "function_call_output"
+        and item.get("call_id") not in recent_call_ids
+    ]
+    if orphaned_outputs:
+        recent_items = [
+            item for item in recent_items if item not in orphaned_outputs
+        ]
+        old_items.extend(orphaned_outputs)
+
     chunks: List[List[Any]] = []
     current_chunk: List[Any] = []
     current_tokens = 0
