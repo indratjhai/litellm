@@ -40,6 +40,26 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _is_claude_code_compaction_request(messages: Sequence[Any]) -> bool:
+        """Identify Claude Code's plain-text-only reactive compact prompt."""
+        text_parts: List[str] = []
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                text_parts.extend(
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and isinstance(block.get("text"), str)
+                )
+        prompt = "\n".join(text_parts)
+        return (
+            "REMINDER: Do NOT call any tools. Respond with plain text only" in prompt
+            and "<summary>" in prompt
+        )
+
+    @staticmethod
     def _translate_anthropic_image_source_to_url(source: dict) -> Optional[str]:
         """Convert Anthropic image source to a URL string."""
         source_type = source.get("type")
@@ -408,9 +428,13 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                 )
             )
 
-        # thinking -> reasoning
+        # ChatGPT can spend the full output budget reasoning about Claude
+        # Code's large compaction prompt, leaving no plain-text summary.
+        # Compaction explicitly requires plain text, so skip reasoning there.
         thinking = anthropic_request.get("thinking")
-        if isinstance(thinking, dict):
+        if isinstance(thinking, dict) and not self._is_claude_code_compaction_request(
+            messages_list
+        ):
             output_config = anthropic_request.get("output_config")
             reasoning = self.translate_thinking_to_reasoning(
                 thinking,
