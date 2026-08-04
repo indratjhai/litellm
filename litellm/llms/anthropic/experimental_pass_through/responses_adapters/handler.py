@@ -4,9 +4,11 @@ Handler for the Anthropic v1/messages -> OpenAI Responses API path.
 Used when the target model is an OpenAI or Azure model.
 """
 
+import json
 from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union
 
 import litellm
+from litellm.exceptions import ContextWindowExceededError
 from litellm.types.llms.anthropic import AnthropicMessagesRequest
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
@@ -17,6 +19,140 @@ from .streaming_iterator import AnthropicResponsesStreamWrapper
 from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
+_CHATGPT_COMPACTION_INPUT_BUDGET = 100_000
+_CHATGPT_COMPACTION_RECENT_BUDGET = 35_000
+_CHATGPT_COMPACTION_CHUNK_BUDGET = 45_000
+
+
+def _count_compaction_tokens(value: Any) -> int:
+    serialized = json.dumps(value, ensure_ascii=False)
+    try:
+        return litellm.token_counter(model="gpt-4o", text=serialized)
+    except Exception:
+        return len(serialized) // 4
+
+
+def _text_from_response(response: ResponsesAPIResponse) -> str:
+    translated = _ADAPTER.translate_response(response)
+    content = (
+        translated.get("content", [])
+        if isinstance(translated, dict)
+        else translated.content
+    )
+    return "\n".join(
+        block.get("text", "")
+        for block in content
+        if block.get("type") == "text" and block.get("text")
+    ).strip()
+
+
+async def _reduce_oversized_compaction(
+    messages: List[Dict],
+    responses_kwargs: Dict[str, Any],
+    model: str,
+    provider_kwargs: Dict[str, Any],
+) -> None:
+    """Hierarchically summarize old compact input without dropping it."""
+    if not _ADAPTER._is_claude_code_compaction_request(messages):
+        return
+
+    input_items = responses_kwargs.get("input")
+    if not isinstance(input_items, list) or _count_compaction_tokens(
+        {"input": input_items, "instructions": responses_kwargs.get("instructions", "")}
+    ) <= _CHATGPT_COMPACTION_INPUT_BUDGET:
+        return
+
+    recent_items: List[Dict] = []
+    recent_tokens = 0
+    for item in reversed(input_items):
+        item_tokens = _count_compaction_tokens(item)
+        if recent_items and recent_tokens + item_tokens > _CHATGPT_COMPACTION_RECENT_BUDGET:
+            break
+        recent_items.append(item)
+        recent_tokens += item_tokens
+    recent_items.reverse()
+    old_items = input_items[: len(input_items) - len(recent_items)]
+
+    chunks: List[List[Any]] = []
+    current_chunk: List[Any] = []
+    current_tokens = 0
+    for item in old_items:
+        item_parts: List[Any] = [item]
+        if _count_compaction_tokens(item) > _CHATGPT_COMPACTION_CHUNK_BUDGET:
+            serialized_item = json.dumps(item, ensure_ascii=False)
+            item_parts = [
+                {
+                    "fragment": fragment_index,
+                    "content": serialized_item[offset : offset + 120_000],
+                }
+                for fragment_index, offset in enumerate(
+                    range(0, len(serialized_item), 120_000), start=1
+                )
+            ]
+        for item_part in item_parts:
+            item_tokens = _count_compaction_tokens(item_part)
+            if (
+                current_chunk
+                and current_tokens + item_tokens > _CHATGPT_COMPACTION_CHUNK_BUDGET
+            ):
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(item_part)
+            current_tokens += item_tokens
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    summaries: List[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        summary_prompt = (
+            "Create a precise continuity summary of this earlier conversation "
+            "section for a later summarization pass. Preserve decisions, user "
+            "requests, completed work, open work, constraints, and identifiers. "
+            "Do not call tools.\n\n"
+            f"Section {index} of {len(chunks)}:\n{json.dumps(chunk, ensure_ascii=False)}"
+        )
+        summary_response = await litellm.aresponses(
+            model=responses_kwargs["model"],
+            input=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": summary_prompt}],
+                }
+            ],
+            max_output_tokens=2_000,
+            **{
+                key: provider_kwargs[key]
+                for key in ("custom_llm_provider", "api_key", "api_base", "api_version")
+                if provider_kwargs.get(key) is not None
+            },
+        )
+        if not isinstance(summary_response, ResponsesAPIResponse):
+            raise ValueError(
+                f"Expected ResponsesAPIResponse, got {type(summary_response)}"
+            )
+        summary_text = _text_from_response(summary_response)
+        if not summary_text:
+            raise ContextWindowExceededError(
+                message="Unable to summarize an earlier compaction section.",
+                model=model,
+                llm_provider="chatgpt",
+            )
+        summaries.append(summary_text)
+
+    responses_kwargs["input"] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "Earlier conversation sections:\n\n"
+                    + "\n\n".join(summaries),
+                }
+            ],
+        },
+        *recent_items,
+    ]
 
 
 def _build_responses_kwargs(
@@ -178,6 +314,7 @@ class LiteLLMMessagesToResponsesAPIHandler:
             output_format=output_format,
             extra_kwargs=kwargs,
         )
+        await _reduce_oversized_compaction(messages, responses_kwargs, model, kwargs)
 
         result = await litellm.aresponses(**responses_kwargs)
 
@@ -260,7 +397,6 @@ class LiteLLMMessagesToResponsesAPIHandler:
             output_format=output_format,
             extra_kwargs=kwargs,
         )
-
         result = litellm.responses(**responses_kwargs)
 
         if stream:
