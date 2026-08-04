@@ -4,6 +4,7 @@ Handler for the Anthropic v1/messages -> OpenAI Responses API path.
 Used when the target model is an OpenAI or Azure model.
 """
 
+import asyncio
 import json
 from typing import Any, AsyncIterator, Coroutine, Dict, List, Optional, Union
 
@@ -20,8 +21,8 @@ from .transformation import LiteLLMAnthropicToResponsesAPIAdapter
 
 _ADAPTER = LiteLLMAnthropicToResponsesAPIAdapter()
 _CHATGPT_COMPACTION_INPUT_BUDGET = 100_000
-_CHATGPT_COMPACTION_RECENT_BUDGET = 35_000
-_CHATGPT_COMPACTION_CHUNK_BUDGET = 45_000
+_CHATGPT_COMPACTION_RECENT_BUDGET = 25_000
+_CHATGPT_COMPACTION_CHUNK_BUDGET = 90_000
 
 
 def _count_compaction_tokens(value: Any) -> int:
@@ -103,13 +104,12 @@ async def _reduce_oversized_compaction(
     if current_chunk:
         chunks.append(current_chunk)
 
-    summaries: List[str] = []
-    for index, chunk in enumerate(chunks, start=1):
+    async def summarize_chunk(index: int, chunk: List[Any]) -> str:
         summary_prompt = (
             "Create a precise continuity summary of this earlier conversation "
             "section for a later summarization pass. Preserve decisions, user "
             "requests, completed work, open work, constraints, and identifiers. "
-            "Do not call tools.\n\n"
+            "Do not call tools. Keep the summary concise.\n\n"
             f"Section {index} of {len(chunks)}:\n{json.dumps(chunk, ensure_ascii=False)}"
         )
         summary_response = await litellm.aresponses(
@@ -120,7 +120,7 @@ async def _reduce_oversized_compaction(
                     "content": [{"type": "input_text", "text": summary_prompt}],
                 }
             ],
-            max_output_tokens=2_000,
+            max_output_tokens=600,
             **{
                 key: provider_kwargs[key]
                 for key in ("custom_llm_provider", "api_key", "api_base", "api_version")
@@ -138,7 +138,11 @@ async def _reduce_oversized_compaction(
                 model=model,
                 llm_provider="chatgpt",
             )
-        summaries.append(summary_text)
+        return summary_text
+
+    summaries = await asyncio.gather(
+        *(summarize_chunk(index, chunk) for index, chunk in enumerate(chunks, start=1))
+    )
 
     responses_kwargs["input"] = [
         {
