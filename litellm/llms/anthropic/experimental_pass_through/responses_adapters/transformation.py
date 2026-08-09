@@ -560,6 +560,11 @@ class LiteLLMAnthropicToResponsesAPIAdapter:
                     )
                     stop_reason = "tool_use"
 
+        # This OpenAI-internal extension is invalid in Anthropic tool blocks,
+        # including when its value is empty.
+        for block in content:
+            block.pop("provider_specific_fields", None)
+
         # status -> stop_reason override
         if response.status == "incomplete":
             stop_reason = "max_tokens"
